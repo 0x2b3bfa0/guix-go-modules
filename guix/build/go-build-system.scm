@@ -131,7 +131,7 @@
 ;;
 ;; Code:
 
-(define* (setup-go-environment #:key inputs outputs #:allow-other-keys)
+(define* (setup-go-environment #:key inputs outputs go-module-inputs module? #:allow-other-keys)
   "Prepare a Go build environment for INPUTS and OUTPUTS.  Build a file system
 union of INPUTS.  Export GOPATH, which helps the compiler find the source code
 of the package being built and its dependencies, and GOBIN, which determines
@@ -143,11 +143,17 @@ dependencies, so it should be self-contained."
   (setenv "GOCACHE" "/tmp/go-cache")
   ;; Using the current working directory as GOPATH makes it easier for packagers
   ;; who need to manipulate the unpacked source code.
-  (setenv "GOPATH" (getcwd))
+  (set-path-environment-variable "GOPATH" (list ".")
+    `(,(getcwd) ,@(match go-module-inputs
+      (((_ . dir) ...)
+       dir)
+      (#f
+       '()))))
+
   ;; Go 1.13 uses go modules by default. The go build system does not
   ;; currently support modules, so turn modules off to continue using the old
   ;; GOPATH behavior.
-  (setenv "GO111MODULE" "off")
+  (setenv "GO111MODULE" (if module? "on" "off"))
   (setenv "GOBIN" (string-append (assoc-ref outputs "out") "/bin"))
   (let ((tmpdir (tmpnam)))
     (match (go-inputs inputs)
@@ -157,18 +163,18 @@ dependencies, so it should be self-contained."
                     #:log-port (%make-void-port "w"))))
     ;; XXX A little dance because (guix build union) doesn't use mkdir-p.
     (copy-recursively tmpdir
-                      (string-append (getenv "GOPATH"))
+                      (first (parse-path (getenv "GOPATH")))
                       #:keep-mtime? #t)
     (delete-file-recursively tmpdir))
   #t)
 
-(define* (unpack #:key source import-path unpack-path #:allow-other-keys)
+(define* (unpack #:key source import-path unpack-path module? #:allow-other-keys)
   "Relative to $GOPATH, unpack SOURCE in UNPACK-PATH, or IMPORT-PATH when
 UNPACK-PATH is unset.  If the SOURCE archive has a single top level directory,
-it is stripped so that the sources appear directly under UNPACK-PATH.  When
-SOURCE is a directory, copy its content into UNPACK-PATH instead of
-unpacking."
-  (define (unpack-maybe-strip source dest)
+and MAYBE-STRIP? is true, it is stripped so that the sources appear directly
+under UNPACK-PATH.  When SOURCE is a directory, copy its content into
+UNPACK-PATH instead of unpacking."
+  (define* (unpack-maybe-strip source dest #:key (maybe-strip? #t))
     (let* ((scratch-dir (string-append (or (getenv "TMPDIR") "/tmp")
                                        "/scratch-dir"))
            (out (mkdir-p scratch-dir)))
@@ -179,27 +185,34 @@ unpacking."
         (let ((top-level-files (remove (lambda (x)
                                          (member x '("." "..")))
                                        (scandir "."))))
-          (match top-level-files
-            ((top-level-file)
-             (when (file-is-directory? top-level-file)
-               (copy-recursively top-level-file dest #:keep-mtime? #t)))
-            (_
-             (copy-recursively "." dest #:keep-mtime? #t)))))
+          (if maybe-strip?
+            (match top-level-files
+              ((top-level-file)
+               (when (file-is-directory? top-level-file)
+                 (copy-recursively top-level-file dest #:keep-mtime? #t)))
+              (_
+               (copy-recursively "." dest #:keep-mtime? #t)))
+            (copy-recursively "." dest #:keep-mtime? #t))))
       (delete-file-recursively scratch-dir)))
 
   (when (string-null? import-path)
     (display "WARNING: The Go import path is unset.\n"))
   (when (string-null? unpack-path)
     (set! unpack-path import-path))
-  (let ((dest (string-append (getenv "GOPATH") "/src/" unpack-path)))
-    (mkdir-p dest)
+  (let* ((path (first (parse-path (getenv "GOPATH"))))
+         (base (string-append path (if module? "/pkg/mod/" "/src/")))
+         (destination (string-append base (if module? "" unpack-path))))
+    (mkdir-p destination)
     (if (file-is-directory? source)
-        (copy-recursively source dest #:keep-mtime? #t)
-        (unpack-maybe-strip source dest)))
+        (copy-recursively source destination #:keep-mtime? #t)
+        (unpack-maybe-strip source destination #:maybe-strip? (not module?))))
   #t)
 
 (define (go-package? name)
   (string-prefix? "go-" name))
+
+(define* (go-package-or-module-base path module? #:key (base (first (parse-path (getenv "GOPATH")))))
+  (string-append base (if module? "/pkg/mod/" "/src/") path))
 
 (define (go-inputs inputs)
   "Return the alist of INPUTS that are Go software."
@@ -216,28 +229,32 @@ unpacking."
                 (_ #f))
               inputs))))
 
-(define* (build #:key import-path build-flags #:allow-other-keys)
+(define* (build #:key import-path build-flags module? build? #:allow-other-keys)
   "Build the package named by IMPORT-PATH."
-  (with-throw-handler
-    #t
-    (lambda _
-      (apply invoke "go" "install"
-              "-v" ; print the name of packages as they are compiled
-              "-x" ; print each command as it is invoked
-              ;; Respectively, strip the symbol table and debug
-              ;; information, and the DWARF symbol table.
-              "-ldflags=-s -w"
-              `(,@build-flags ,import-path)))
-    (lambda (key . args)
-      (display (string-append "Building '" import-path "' failed.\n"
-                              "Here are the results of `go env`:\n"))
-      (invoke "go" "env"))))
+  (when build?
+    (with-directory-excursion (go-package-or-module-base import-path module?)
+      (with-throw-handler
+        #t
+        (lambda _
+          (apply invoke "go" "install"
+                  "-v" ; print the name of packages as they are compiled
+                  "-x" ; print each command as it is invoked
+                  ;; Respectively, strip the symbol table and debug
+                  ;; information, and the DWARF symbol table.
+                  "-ldflags=-s -w"
+                  `(,@build-flags ,(if module? "./..." import-path))))
+        (lambda (key . args)
+          (display (string-append "Building '" import-path "' failed.\n"
+                                  "Here are the results of `go env`:\n"))
+          (invoke "ls" "-la" "/gnu/store")))))
+  #t)
 
 ;; Can this also install commands???
-(define* (check #:key tests? import-path #:allow-other-keys)
+(define* (check #:key tests? import-path module? #:allow-other-keys)
   "Run the tests for the package named by IMPORT-PATH."
   (when tests?
-    (invoke "go" "test" import-path))
+    (with-directory-excursion (go-package-or-module-base import-path module?)
+      (invoke "go" "test" (if module? "./..." import-path))))
   #t)
 
 (define* (install #:key install-source? outputs import-path unpack-path #:allow-other-keys)
@@ -249,21 +266,22 @@ XXX We can't make use of compiled libraries (Go \"packages\")."
     (if (string-null? import-path)
         ((display "WARNING: The Go import path is unset.\n")))
     (let* ((out (assoc-ref outputs "out"))
-           (source (string-append (getenv "GOPATH") "/src/" import-path))
-           (dest (string-append out "/src/" import-path)))
+           (source (go-package-or-module-base import-path module?))
+           (dest (go-package-or-module-base import-path module? #:base out)))
       (mkdir-p dest)
       (copy-recursively source dest #:keep-mtime? #t)))
   #t)
 
 (define* (install-license-files #:key unpack-path
                                 import-path
+                                module?
                                 #:allow-other-keys
                                 #:rest args)
   "Install license files matching LICENSE-FILE-REGEXP to 'share/doc'.  Adjust
 the standard install-license-files phase to first enter the correct directory."
-  (with-directory-excursion (string-append "src/" (if (string-null? unpack-path)
-                                                    import-path
-                                                    unpack-path))
+  (with-directory-excursion (go-package-or-module-base (if (string-null? unpack-path)
+                                                import-path
+                                                unpack-path) module?)
     (apply (assoc-ref gnu:%standard-phases 'install-license-files) args)))
 
 (define* (remove-store-reference file file-name

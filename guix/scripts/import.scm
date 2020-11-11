@@ -3,6 +3,7 @@
 ;;; Copyright © 2014 David Thompson <davet@gnu.org>
 ;;; Copyright © 2018 Kyle Meyer <kyle@kyleam.com>
 ;;; Copyright © 2019 Ricardo Wurmus <rekado@elephly.net>
+;;; Copyright © 2020 Helio Machado <0x2b3bfa0+guix@googlemail.com>
 ;;;
 ;;; This file is part of GNU Guix.
 ;;;
@@ -77,7 +78,7 @@ rather than \\n."
 ;;;
 
 (define importers '("gnu" "nix" "pypi" "cpan" "hackage" "stackage" "elpa" "gem"
-                    "cran" "crate" "texlive" "json" "opam"))
+                    "cran" "crate" "texlive" "json" "opam" "go-modules"))
 
 (define (resolve-importer name)
   (let ((module (resolve-interface
